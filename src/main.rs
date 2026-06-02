@@ -142,10 +142,13 @@ fn install_sigpipe_default() {}
 
 #[cfg(unix)]
 extern "C" fn handle_cancel_signal(_: libc::c_int) {
-    // AtomicBool::store compiles to a single atomic store on every supported
-    // target — async-signal-safe in practice. No allocations, no syscalls,
-    // no library calls from inside the handler.
-    CANCEL.store(true, Ordering::Relaxed);
+    // _exit is async-signal-safe and bypasses destructors / atexit handlers.
+    // We use it instead of merely flipping a flag because the in-progress
+    // match_score() call on a single huge "line" (minified JS, JSON, lockfile)
+    // can run for hundreds of ms without ever returning to a point where a
+    // flag check could fire. Partial top-K state is meaningless on cancel —
+    // there's nothing worth flushing.
+    unsafe { libc::_exit(130) };
 }
 
 #[cfg(unix)]
@@ -204,8 +207,11 @@ impl Watchdog {
                     break;
                 }
                 if pfds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                    CANCEL.store(true, Ordering::Relaxed);
-                    break;
+                    // Same reasoning as the signal handler: don't try to flag-and-poll
+                    // our way out of a deep match_score on a giant "line". Terminate
+                    // the process directly. The consumer (Telescope) closed the pipe,
+                    // so there's nothing to flush.
+                    unsafe { libc::_exit(130) };
                 }
             }
             unsafe { libc::close(wake_rd) };
