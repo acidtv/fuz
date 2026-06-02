@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ignore = "0.4"
+lexopt = "0.3"
 memchr = "2.7"
 mimalloc = { version = "0.1", default-features = false }
 libc = "0.2"

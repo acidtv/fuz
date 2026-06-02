@@ -37,8 +37,8 @@ fn main() {
 
     let Args { needle, top_n, limits } = match parse_args() {
         Ok(v) => v,
-        Err(msg) => {
-            eprintln!("{msg}");
+        Err(err) => {
+            eprintln!("{err}");
             eprintln!("usage: fuz [-n N] [--no-file-limit] [--no-line-limit] PATTERN");
             std::process::exit(2);
         }
@@ -105,41 +105,30 @@ struct Args {
     limits: Limits,
 }
 
-fn parse_args() -> Result<Args, String> {
-    let mut args = std::env::args().skip(1);
+fn parse_args() -> Result<Args, lexopt::Error> {
+    use lexopt::prelude::*;
+
+    let mut parser = lexopt::Parser::from_env();
     let mut needle: Option<String> = None;
     let mut top_n: usize = DEFAULT_TOP_N;
     let mut max_file_size: Option<u64> = Some(DEFAULT_MAX_FILE_SIZE);
     let mut max_line_len: Option<usize> = Some(DEFAULT_MAX_LINE_LEN);
-    while let Some(a) = args.next() {
-        if a == "-n" {
-            let n_str = args.next().ok_or_else(|| "-n requires a value".to_string())?;
-            let n: usize = n_str
-                .parse()
-                .map_err(|_| format!("-n: invalid number: {n_str}"))?;
-            if n == 0 {
-                return Err("-n must be >= 1".to_string());
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('n') => {
+                let n: usize = parser.value()?.parse()?;
+                if n == 0 {
+                    return Err(lexopt::Error::Custom("-n must be >= 1".into()));
+                }
+                top_n = n;
             }
-            top_n = n;
-        } else if a == "--no-file-limit" {
-            max_file_size = None;
-        } else if a == "--no-line-limit" {
-            max_line_len = None;
-        } else if a == "--" {
-            needle = args.next();
-            break;
-        } else if a.starts_with('-') && a.len() > 1 {
-            return Err(format!("unknown flag: {a}"));
-        } else if needle.is_none() {
-            needle = Some(a);
-        } else {
-            return Err("too many positional arguments".to_string());
+            Long("no-file-limit") => max_file_size = None,
+            Long("no-line-limit") => max_line_len = None,
+            Value(v) if needle.is_none() => needle = Some(v.string()?),
+            _ => return Err(arg.unexpected()),
         }
     }
-    let needle = needle.ok_or_else(|| "missing PATTERN".to_string())?;
-    if args.next().is_some() {
-        return Err("too many positional arguments".to_string());
-    }
+    let needle = needle.ok_or_else(|| lexopt::Error::Custom("missing PATTERN".into()))?;
     Ok(Args {
         needle,
         top_n,
