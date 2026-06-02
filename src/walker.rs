@@ -155,8 +155,8 @@ fn search_buffer(
         if first_line && line.starts_with(BOM) {
             line = &line[BOM.len()..];
         }
-        if let Some(score) = matcher.match_score(line) {
-            topk.try_insert(score, prefix, line_no, line);
+        if let Some((score, start)) = matcher.match_score(line) {
+            topk.try_insert(score, prefix, line_no, (start as u32).saturating_add(1), line);
             n_matches += 1;
         }
         line_start = newline_pos + 1;
@@ -172,8 +172,8 @@ fn search_buffer(
         if first_line && line.starts_with(BOM) {
             line = &line[BOM.len()..];
         }
-        if let Some(score) = matcher.match_score(line) {
-            topk.try_insert(score, prefix, line_no, line);
+        if let Some((score, start)) = matcher.match_score(line) {
+            topk.try_insert(score, prefix, line_no, (start as u32).saturating_add(1), line);
             n_matches += 1;
         }
     }

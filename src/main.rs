@@ -68,7 +68,7 @@ fn main() {
     let mut staging: Vec<u8> = Vec::with_capacity(512);
     for r in results {
         staging.clear();
-        emit_match(&mut staging, &r.prefix, r.line_no, &r.line);
+        emit_match(&mut staging, &r.prefix, r.line_no, r.col, &r.line);
         let _ = out.write_all(&staging);
     }
     let _ = out.flush();

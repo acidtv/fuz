@@ -1,9 +1,12 @@
 #[inline(always)]
-pub fn emit_match(out: &mut Vec<u8>, prefix: &[u8], line_no: u64, line: &[u8]) {
-    // Worst-case: prefix + 20-digit u64 + ':' + line + '\n'
-    out.reserve(prefix.len() + 22 + line.len());
+pub fn emit_match(out: &mut Vec<u8>, prefix: &[u8], line_no: u64, col: u32, line: &[u8]) {
+    // vimgrep format: path:line:col:content
+    // Worst-case: prefix + 20-digit line_no + ':' + 10-digit col + ':' + line + '\n'
+    out.reserve(prefix.len() + 33 + line.len());
     out.extend_from_slice(prefix);
     write_u64(out, line_no);
+    out.push(b':');
+    write_u64(out, col as u64);
     out.push(b':');
     out.extend_from_slice(line);
     out.push(b'\n');

@@ -3,20 +3,27 @@ use std::borrow::Cow;
 use memchr::{memchr, memchr2};
 
 /// Per-needle-char bonus when that char lands at a word boundary
-/// (preceded by a non-alphanumeric byte, or at position 0). Tuned so that a
-/// tight subsequence cluster contained in one word (1 boundary hit at the
-/// start, small excess spread) scores strictly positive.
+/// (preceded by a non-alphanumeric byte, or at position 0).
 const BOUNDARY_BONUS: i32 = 5;
 /// Penalty per byte of "excess spread" beyond a contiguous substring match.
-/// A literal substring has zero excess spread. Kept low so that a tight
-/// subsequence cluster inside one word (e.g. needle 'rqrs' matching inside
-/// 'requires', excess 3) stays positive — main.rs treats score > 0 as the
-/// "real match" threshold and filters out everything below.
+/// A literal substring has zero excess spread.
 const SPREAD_PENALTY: i32 = 1;
+/// Floor score for any subsequence match whose entire span lies within a
+/// single alphanumeric run (one "word"). Sized so a within-word subseq with
+/// no boundary hit and substantial excess spread still scores strictly
+/// positive, so main.rs's `score > 0` filter keeps it (e.g. `medtl` against
+/// `immediately`: 5 needle chars spread over 8 bytes, no boundary hit →
+/// raw formula gives -3, but the within-word floor lifts it to +61).
+/// Cross-word matches do not get this floor — they fall back to the raw
+/// boundary/spread formula and can go non-positive, which is the desired
+/// behavior for cross-word junk like `requires` formed from `current ...
+/// acquires`.
+const SINGLE_WORD_BASE: i32 = 64;
 /// Floor score for a case-insensitive literal substring match. Sized so that
-/// any literal match strictly beats any subsequence-only match: a subsequence
-/// match's score is bounded above by BOUNDARY_BONUS * needle_len, which for a
-/// 64-char needle is 256; we set the floor well above that.
+/// any literal match strictly beats any subsequence-only match: a within-word
+/// subsequence's score is bounded above by SINGLE_WORD_BASE +
+/// BOUNDARY_BONUS * needle_len, which for a 64-char needle is 384; we set
+/// the floor well above that.
 const LITERAL_BASE: i32 = 1024;
 
 #[inline(always)]
@@ -26,12 +33,15 @@ fn score_alignment(
     last_pos: usize,
     boundary_hits: i32,
     start_boundary: bool,
+    within_one_word: bool,
 ) -> i32 {
     let spread = (last_pos - first_pos) as i32;
     let min_spread = (needle_len as i32) - 1;
     let excess = (spread - min_spread).max(0);
     if excess == 0 {
         LITERAL_BASE + if start_boundary { BOUNDARY_BONUS } else { 0 }
+    } else if within_one_word {
+        SINGLE_WORD_BASE + BOUNDARY_BONUS * boundary_hits - SPREAD_PENALTY * excess
     } else {
         BOUNDARY_BONUS * boundary_hits - SPREAD_PENALTY * excess
     }
@@ -80,29 +90,37 @@ impl Matcher {
         Matcher { lo, hi, unique_lo, unique_hi, ascii_only, case_sensitive }
     }
 
-    /// Returns Some(score) if `hay` contains the needle as a (case-insensitive) subsequence.
-    /// Higher score = better match. Scoring is two-tier:
+    /// Returns Some((score, start)) if `hay` contains the needle as a
+    /// (case-insensitive) subsequence. `start` is the 0-based byte offset in
+    /// `hay` where the best-scoring alignment's first needle char lands;
+    /// callers use it to emit a vimgrep-style column. Higher score = better
+    /// match. Scoring is three-tier:
     /// - **Literal substring match** (highest tier): score = LITERAL_BASE + boundary_bonus
     ///   at the match position. Any literal match strictly beats any non-literal match.
-    /// - **Subsequence-only match** (lower tier): score = BOUNDARY_BONUS * boundary_hits
-    ///   - SPREAD_PENALTY * (spread - min_spread). Tighter and more boundary-aligned
-    ///   alignments score higher.
+    /// - **Within-word subsequence** (middle tier): the match span contains no
+    ///   non-alphanumeric bytes. Score = SINGLE_WORD_BASE + BOUNDARY_BONUS *
+    ///   boundary_hits - SPREAD_PENALTY * excess. The floor keeps these positive
+    ///   even without a boundary hit, so main.rs's `score > 0` filter keeps them.
+    /// - **Cross-word subsequence** (lowest tier): the match span crosses at
+    ///   least one non-alphanumeric byte. Score = BOUNDARY_BONUS * boundary_hits
+    ///   - SPREAD_PENALTY * excess. Can go non-positive and be dropped by main.rs
+    ///   — the desired behavior for junk like `requires` from `current ... acquires`.
     ///
     /// Implementation: **multi-start greedy.** Single-pass greedy from position 0
     /// picks the leftmost occurrence of needle[0], which often produces a bad
     /// alignment when the same byte appears earlier than the "real" cluster
     /// (e.g. needle 'rqrs' on `let n_str = ... requires` picks 'r' from `n_str`).
     /// Instead, iterate every needle[0] position and try greedy from each;
-    /// keep the best score. Early-exit when a literal lands at a word boundary
-    /// (best possible). If greedy from one position fails (a later needle char
-    /// is missing), all later starts also fail (their suffix is a subset), so
-    /// we break the iteration.
+    /// keep the best score (and the start position that produced it).
+    /// Early-exit when a literal lands at a word boundary (best possible).
+    /// If greedy from one position fails (a later needle char is missing),
+    /// all later starts also fail (their suffix is a subset), so we break.
     ///
-    /// For empty needles, returns Some(0).
+    /// For empty needles, returns Some((0, 0)).
     #[inline]
-    pub fn match_score(&self, hay: &[u8]) -> Option<i32> {
+    pub fn match_score(&self, hay: &[u8]) -> Option<(i32, usize)> {
         if self.lo.is_empty() {
-            return Some(0);
+            return Some((0, 0));
         }
         if self.lo.len() > hay.len() {
             return None;
@@ -115,12 +133,12 @@ impl Matcher {
     }
 
     #[inline(always)]
-    fn match_score_ascii(&self, hay: &[u8]) -> Option<i32> {
+    fn match_score_ascii(&self, hay: &[u8]) -> Option<(i32, usize)> {
         let n = self.lo.len();
         let first_lo = self.lo[0];
         let first_hi = self.hi[0];
         let best_possible = LITERAL_BASE + BOUNDARY_BONUS;
-        let mut best: Option<i32> = None;
+        let mut best: Option<(i32, usize)> = None;
         let mut search_from = 0usize;
 
         loop {
@@ -160,19 +178,24 @@ impl Matcher {
                 return best;
             }
 
-            let score = score_alignment(n, start, last_pos, boundary_hits, start_boundary);
+            let within_one_word = hay[start..=last_pos]
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric());
+            let score = score_alignment(
+                n, start, last_pos, boundary_hits, start_boundary, within_one_word,
+            );
             if score == best_possible {
-                return Some(score);
+                return Some((score, start));
             }
             best = Some(match best {
-                None => score,
-                Some(b) => b.max(score),
+                None => (score, start),
+                Some((b, bs)) => if score > b { (score, start) } else { (b, bs) },
             });
             search_from = start + 1;
         }
     }
 
-    fn match_score_slow(&self, hay: &[u8]) -> Option<i32> {
+    fn match_score_slow(&self, hay: &[u8]) -> Option<(i32, usize)> {
         let n = self.lo.len();
         let folded: Cow<[u8]> = if self.case_sensitive {
             Cow::Borrowed(hay)
@@ -181,7 +204,7 @@ impl Matcher {
         };
         let first = self.lo[0];
         let best_possible = LITERAL_BASE + BOUNDARY_BONUS;
-        let mut best: Option<i32> = None;
+        let mut best: Option<(i32, usize)> = None;
         let mut search_from = 0usize;
 
         loop {
@@ -215,13 +238,18 @@ impl Matcher {
                 return best;
             }
 
-            let score = score_alignment(n, start, last_pos, boundary_hits, start_boundary);
+            let within_one_word = hay[start..=last_pos]
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric());
+            let score = score_alignment(
+                n, start, last_pos, boundary_hits, start_boundary, within_one_word,
+            );
             if score == best_possible {
-                return Some(score);
+                return Some((score, start));
             }
             best = Some(match best {
-                None => score,
-                Some(b) => b.max(score),
+                None => (score, start),
+                Some((b, bs)) => if score > b { (score, start) } else { (b, bs) },
             });
             search_from = start + 1;
         }
@@ -300,16 +328,16 @@ mod tests {
         // Both have a single boundary-hit (the leading 'p' at position 0); the
         // tighter alignment wins on spread alone. Filler chars are alphanumeric
         // so no extra boundary bonuses fire.
-        let tight = m.match_score(b"pattern").unwrap();
-        let loose = m.match_score(b"pAAAAAAtAAAAAAtAAAAArAAAAAn").unwrap();
+        let tight = m.match_score(b"pattern").unwrap().0;
+        let loose = m.match_score(b"pAAAAAAtAAAAAAtAAAAArAAAAAn").unwrap().0;
         assert!(tight > loose, "tight={} loose={}", tight, loose);
     }
 
     #[test]
     fn word_boundary_bonus() {
         let m = Matcher::new("foo");
-        let underscore = m.match_score(b"my_foo").unwrap(); // foo after _: word boundary
-        let inline = m.match_score(b"barfoo").unwrap();      // foo buried: no boundary on f
+        let underscore = m.match_score(b"my_foo").unwrap().0; // foo after _: word boundary
+        let inline = m.match_score(b"barfoo").unwrap().0;      // foo buried: no boundary on f
         assert!(underscore > inline, "underscore={} inline={}", underscore, inline);
     }
 
@@ -324,8 +352,39 @@ mod tests {
         // `rqrs` clustering inside `requires` is a real match the user wants
         // to see. Score must be > 0 so the main.rs filter keeps it.
         let m = Matcher::new("rqrs");
-        let s = m.match_score(b"            ... requires ...").unwrap();
+        let s = m.match_score(b"            ... requires ...").unwrap().0;
         assert!(s > 0, "score was {s}");
+    }
+
+    #[test]
+    fn within_word_subseq_without_boundary_hit_scores_positive() {
+        // `medtl` against `immediately` lands the first needle char at byte 1
+        // (no leading word boundary), so boundary_hits=0. The raw boundary/
+        // spread formula gives a negative score, but the entire match span is
+        // inside one alphanumeric run — the within-word floor must keep it
+        // positive so main.rs's `score > 0` filter doesn't drop it.
+        let m = Matcher::new("medtl");
+        let s = m.match_score(b"  immediately follows").unwrap().0;
+        assert!(s > 0, "score was {s}");
+    }
+
+    #[test]
+    fn within_word_no_boundary_scores_below_within_word_with_boundary() {
+        // Both lines match within a single word, but `rqrs` in `requires`
+        // hits the leading word boundary while `medtl` in `immediately`
+        // doesn't. The boundary-hit alignment must rank higher.
+        let with_boundary = Matcher::new("rqrs")
+            .match_score(b"    requires foo")
+            .unwrap()
+            .0;
+        let without_boundary = Matcher::new("medtl")
+            .match_score(b"  immediately follows")
+            .unwrap()
+            .0;
+        assert!(
+            with_boundary > without_boundary,
+            "with_boundary={with_boundary} without_boundary={without_boundary}"
+        );
     }
 
     #[test]
@@ -333,7 +392,7 @@ mod tests {
         // `requires` matching via chars from `current` + `acquires` is junk
         // and must not survive the main.rs `score > 0` filter.
         let m = Matcher::new("requires");
-        let s = m.match_score(b"beat the current cutoff. Slow-path acquires").unwrap();
+        let s = m.match_score(b"beat the current cutoff. Slow-path acquires").unwrap().0;
         assert!(s <= 0, "score was {s}");
     }
 
@@ -346,8 +405,8 @@ mod tests {
         let m = Matcher::new("rqrs");
         let tight = m
             .match_score(b"    let n_str = args.next() requires a value")
-            .unwrap();
-        let spread = m.match_score(b"        .require_git(false)").unwrap();
+            .unwrap().0;
+        let spread = m.match_score(b"        .require_git(false)").unwrap().0;
         assert!(
             tight > spread,
             "tight_cluster={} spread_match={}",
@@ -362,9 +421,9 @@ mod tests {
         // grabs the 'e' in "extern", producing a loose spread. But the literal
         // "errno" is also in the line, so the literal-path must fire and dominate.
         let m = Matcher::new("errno");
-        let lit_score = m.match_score(b"extern int *errno_location").unwrap();
+        let lit_score = m.match_score(b"extern int *errno_location").unwrap().0;
         // "err is not yet": e,r,r... n in "not"... o in "not". subseq matches, no literal.
-        let subseq_score = m.match_score(b"err is not yet").unwrap();
+        let subseq_score = m.match_score(b"err is not yet").unwrap().0;
         assert!(
             lit_score > subseq_score,
             "literal={} subseq={}",
@@ -377,8 +436,8 @@ mod tests {
     #[test]
     fn literal_at_word_boundary_beats_buried_literal() {
         let m = Matcher::new("foo");
-        let at_boundary = m.match_score(b"my_foo_bar").unwrap();
-        let buried = m.match_score(b"myfoobar").unwrap();
+        let at_boundary = m.match_score(b"my_foo_bar").unwrap().0;
+        let buried = m.match_score(b"myfoobar").unwrap().0;
         assert!(at_boundary > buried);
         assert!(buried >= LITERAL_BASE); // still a literal match
     }
@@ -386,8 +445,29 @@ mod tests {
     #[test]
     fn empty_needle_scores_zero() {
         let m = Matcher::new("");
-        assert_eq!(m.match_score(b"anything"), Some(0));
-        assert_eq!(m.match_score(b""), Some(0));
+        assert_eq!(m.match_score(b"anything"), Some((0, 0)));
+        assert_eq!(m.match_score(b""), Some((0, 0)));
+    }
+
+    #[test]
+    fn returns_column_of_best_alignment() {
+        // Literal "foo" appears at byte offset 3 in "my_foo_bar"; that's the
+        // best alignment, so the returned start must be 3.
+        let m = Matcher::new("foo");
+        let (_, start) = m.match_score(b"my_foo_bar").unwrap();
+        assert_eq!(start, 3);
+    }
+
+    #[test]
+    fn multi_start_returns_winning_start() {
+        // Multi-start picks the tight cluster inside "requires" (offset 28),
+        // not the leftmost 'r' in "n_str" (offset 8). The start returned must
+        // point at the alignment that actually won.
+        let m = Matcher::new("rqrs");
+        let (_, start) = m
+            .match_score(b"    let n_str = args.next() requires a value")
+            .unwrap();
+        assert_eq!(start, 28);
     }
 
     #[test]

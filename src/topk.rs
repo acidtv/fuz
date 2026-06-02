@@ -7,6 +7,7 @@ use std::sync::Mutex;
 pub struct Scored {
     pub score: i32,
     pub line_no: u64,
+    pub col: u32, // 1-based byte column of the best alignment's first match
     pub prefix: Box<[u8]>, // b"path:" pre-baked
     pub line: Box<[u8]>,
 }
@@ -49,7 +50,7 @@ impl TopK {
     /// beat the current cutoff. Slow-path acquires the mutex, allocates the
     /// owned bytes, and updates the cutoff if the heap is now full.
     #[inline]
-    pub fn try_insert(&self, score: i32, prefix: &[u8], line_no: u64, line: &[u8]) {
+    pub fn try_insert(&self, score: i32, prefix: &[u8], line_no: u64, col: u32, line: &[u8]) {
         if score <= self.cutoff.load(Ordering::Relaxed) {
             return;
         }
@@ -58,6 +59,7 @@ impl TopK {
             heap.push(Reverse(Scored {
                 score,
                 line_no,
+                col,
                 prefix: prefix.into(),
                 line: line.into(),
             }));
@@ -70,6 +72,7 @@ impl TopK {
             heap.push(Reverse(Scored {
                 score,
                 line_no,
+                col,
                 prefix: prefix.into(),
                 line: line.into(),
             }));
@@ -95,6 +98,7 @@ mod tests {
         Scored {
             score,
             line_no: 0,
+            col: 1,
             prefix: Box::from(&b"p:"[..]),
             line: Box::from(&b"line"[..]),
         }
@@ -104,7 +108,7 @@ mod tests {
     fn keeps_top_k() {
         let t = TopK::new(3);
         for s in [10, 5, 7, 2, 9, 1, 8] {
-            t.try_insert(s, b"p:", 0, b"x");
+            t.try_insert(s, b"p:", 0, 1, b"x");
         }
         let v: Vec<i32> = t.into_sorted_best_first().iter().map(|s| s.score).collect();
         assert_eq!(v, vec![10, 9, 8]);
@@ -113,12 +117,12 @@ mod tests {
     #[test]
     fn cutoff_filters_below() {
         let t = TopK::new(2);
-        t.try_insert(10, b"p:", 0, b"x");
-        t.try_insert(20, b"p:", 0, b"x");
+        t.try_insert(10, b"p:", 0, 1, b"x");
+        t.try_insert(20, b"p:", 0, 1, b"x");
         // Heap is full, cutoff = 10
         assert_eq!(t.cutoff.load(Ordering::Relaxed), 10);
-        t.try_insert(5, b"p:", 0, b"x"); // below cutoff, ignored
-        t.try_insert(10, b"p:", 0, b"x"); // equals cutoff, not strictly greater, ignored
+        t.try_insert(5, b"p:", 0, 1, b"x"); // below cutoff, ignored
+        t.try_insert(10, b"p:", 0, 1, b"x"); // equals cutoff, not strictly greater, ignored
         let v: Vec<i32> = t.into_sorted_best_first().iter().map(|s| s.score).collect();
         assert_eq!(v, vec![20, 10]);
     }
@@ -126,9 +130,9 @@ mod tests {
     #[test]
     fn fewer_than_k_returns_all() {
         let t = TopK::new(10);
-        t.try_insert(3, b"p:", 0, b"x");
-        t.try_insert(1, b"p:", 0, b"x");
-        t.try_insert(2, b"p:", 0, b"x");
+        t.try_insert(3, b"p:", 0, 1, b"x");
+        t.try_insert(1, b"p:", 0, 1, b"x");
+        t.try_insert(2, b"p:", 0, 1, b"x");
         let v: Vec<i32> = t.into_sorted_best_first().iter().map(|s| s.score).collect();
         assert_eq!(v, vec![3, 2, 1]);
     }
