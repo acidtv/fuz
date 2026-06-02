@@ -154,6 +154,14 @@ fn search_buffer(
     let mut n_matches: u64 = 0;
 
     for newline_pos in memchr_iter(b'\n', buf) {
+        // Per-file CANCEL check (in walker callback) isn't granular enough for
+        // very large files — a 200 MiB log can keep one worker pinned in this
+        // loop for hundreds of ms, blocking cancel reaction. Check every 4096
+        // lines: at ~1 ns per atomic load this is unmeasurable, and a 4096-line
+        // chunk of any realistic file finishes in well under 10 ms.
+        if line_no & 0xFFF == 0 && CANCEL.load(Ordering::Relaxed) {
+            return n_matches;
+        }
         let mut line_end = newline_pos;
         if line_end > line_start && buf[line_end - 1] == b'\r' {
             line_end -= 1;
