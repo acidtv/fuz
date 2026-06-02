@@ -12,6 +12,7 @@ use memchr::{memchr, memchr_iter};
 use crate::matcher::Matcher;
 use crate::stats::Stats;
 use crate::topk::TopK;
+use crate::CANCEL;
 
 const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const BINARY_PROBE: usize = 8192;
@@ -40,6 +41,12 @@ pub fn run(matcher: Matcher, topk: Arc<TopK>, stats: &'static Stats) {
         let matcher = Arc::clone(&matcher);
         let topk = Arc::clone(&topk);
         Box::new(move |result| {
+            // One relaxed atomic load per file. Granular enough to react to
+            // cancellation within a typical file's search time; cheap enough
+            // (~1ns) that the dispatch loop overhead is unmeasurable.
+            if CANCEL.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
             let entry = match result {
                 Ok(e) => e,
                 Err(_) => return WalkState::Continue,

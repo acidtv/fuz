@@ -1,4 +1,5 @@
 use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use mimalloc::MiMalloc;
@@ -19,10 +20,19 @@ use topk::TopK;
 
 static STATS: Stats = Stats::new();
 
+// Global cancellation flag. Flipped by SIGINT/SIGTERM handlers and by the
+// stdout-hangup watchdog when the consumer closes the pipe. Checked once per
+// file in the walker callback (cheap relaxed load) — granular enough since
+// files are searched in microseconds-to-milliseconds, fine enough to make
+// Telescope-style "user typed another char, kill the in-flight search"
+// responsive without paying the cost of checking inside the per-line loop.
+pub static CANCEL: AtomicBool = AtomicBool::new(false);
+
 const DEFAULT_TOP_N: usize = 20;
 
 fn main() {
     install_sigpipe_default();
+    install_cancel_handlers();
 
     let (needle, top_n) = match parse_args() {
         Ok(v) => v,
@@ -37,9 +47,19 @@ fn main() {
     let topk = Arc::new(TopK::new(top_n));
     let profile = std::env::var_os("FUZ_PROFILE").is_some();
 
+    let _watchdog = Watchdog::spawn();
+
     let t0 = std::time::Instant::now();
     walker::run(matcher, Arc::clone(&topk), &STATS);
     let wall = t0.elapsed();
+
+    // Cancellation: walker may have exited early because a signal arrived or
+    // the consumer closed stdout. Emit nothing in either case — partial
+    // top-K is not the user-visible ranking and writing to a closed pipe
+    // would SIGPIPE us mid-flush anyway.
+    if CANCEL.load(Ordering::Relaxed) {
+        std::process::exit(130);
+    }
 
     // Final dump: drain heap, sort score-desc + path-asc + line-asc, write through
     // a 64 KiB BufWriter. The explicit sort overrides the heap's internal tiebreaks
@@ -119,3 +139,100 @@ fn install_sigpipe_default() {
 
 #[cfg(not(unix))]
 fn install_sigpipe_default() {}
+
+#[cfg(unix)]
+extern "C" fn handle_cancel_signal(_: libc::c_int) {
+    // AtomicBool::store compiles to a single atomic store on every supported
+    // target — async-signal-safe in practice. No allocations, no syscalls,
+    // no library calls from inside the handler.
+    CANCEL.store(true, Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn install_cancel_handlers() {
+    let handler = handle_cancel_signal as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_cancel_handlers() {}
+
+/// Watches stdout for hangup so that consumers (e.g. Telescope) which cancel
+/// by closing the read end of the pipe get a prompt reaction. Without this,
+/// `fuz` would not notice — output is fully buffered until after the walker
+/// finishes, so SIGPIPE never fires during the search.
+///
+/// Implementation: poll() fd 1 with events=0 (POLLHUP/POLLERR are reported
+/// regardless of the events mask) plus a self-pipe so main can wake the
+/// thread instantly when the search completes normally. Idle cost is zero —
+/// the thread sleeps inside poll().
+#[cfg(unix)]
+struct Watchdog {
+    wake_wr: libc::c_int,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Watchdog {
+    fn spawn() -> Option<Self> {
+        let mut fds: [libc::c_int; 2] = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let wake_rd = fds[0];
+        let wake_wr = fds[1];
+
+        let handle = std::thread::spawn(move || {
+            loop {
+                let mut pfds = [
+                    libc::pollfd { fd: 1, events: 0, revents: 0 },
+                    libc::pollfd { fd: wake_rd, events: libc::POLLIN, revents: 0 },
+                ];
+                let r = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                if r < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if pfds[1].revents != 0 {
+                    break;
+                }
+                if pfds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                    CANCEL.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            unsafe { libc::close(wake_rd) };
+        });
+
+        Some(Self { wake_wr, handle: Some(handle) })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        let byte: u8 = 0;
+        unsafe {
+            libc::write(self.wake_wr, &byte as *const u8 as *const libc::c_void, 1);
+            libc::close(self.wake_wr);
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct Watchdog;
+
+#[cfg(not(unix))]
+impl Watchdog {
+    fn spawn() -> Option<Self> { None }
+}
