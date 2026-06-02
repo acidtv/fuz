@@ -13,6 +13,14 @@ Like ripgrep, but with fuzzy matching instead of regular expression matching.
 
 ## Usage
 
+```
+fuz [-n N] [--no-file-limit] [--no-line-limit] PATTERN
+```
+
+- `-n N` — return at most N results (default 20).
+- `--no-file-limit` — search files larger than 10 MiB (skipped by default).
+- `--no-line-limit` — search lines longer than 64 KiB (skipped by default).
+
 Example searching the Linux kernel source:
 ```bash
 linux-7.1-rc6$ time fuz bpflstdta

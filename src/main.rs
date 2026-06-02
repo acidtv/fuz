@@ -17,6 +17,7 @@ use matcher::Matcher;
 use printer::emit_match;
 use stats::Stats;
 use topk::TopK;
+use walker::{Limits, DEFAULT_MAX_FILE_SIZE, DEFAULT_MAX_LINE_LEN};
 
 static STATS: Stats = Stats::new();
 
@@ -34,11 +35,11 @@ fn main() {
     install_sigpipe_default();
     install_cancel_handlers();
 
-    let (needle, top_n) = match parse_args() {
+    let Args { needle, top_n, limits } = match parse_args() {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("{msg}");
-            eprintln!("usage: fuz [-n N] PATTERN");
+            eprintln!("usage: fuz [-n N] [--no-file-limit] [--no-line-limit] PATTERN");
             std::process::exit(2);
         }
     };
@@ -50,7 +51,7 @@ fn main() {
     let _watchdog = Watchdog::spawn();
 
     let t0 = std::time::Instant::now();
-    walker::run(matcher, Arc::clone(&topk), &STATS);
+    walker::run(matcher, Arc::clone(&topk), &STATS, limits);
     let wall = t0.elapsed();
 
     // Cancellation: walker may have exited early because a signal arrived or
@@ -98,10 +99,18 @@ fn main() {
     }
 }
 
-fn parse_args() -> Result<(String, usize), String> {
+struct Args {
+    needle: String,
+    top_n: usize,
+    limits: Limits,
+}
+
+fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
     let mut needle: Option<String> = None;
     let mut top_n: usize = DEFAULT_TOP_N;
+    let mut max_file_size: Option<u64> = Some(DEFAULT_MAX_FILE_SIZE);
+    let mut max_line_len: Option<usize> = Some(DEFAULT_MAX_LINE_LEN);
     while let Some(a) = args.next() {
         if a == "-n" {
             let n_str = args.next().ok_or_else(|| "-n requires a value".to_string())?;
@@ -112,6 +121,10 @@ fn parse_args() -> Result<(String, usize), String> {
                 return Err("-n must be >= 1".to_string());
             }
             top_n = n;
+        } else if a == "--no-file-limit" {
+            max_file_size = None;
+        } else if a == "--no-line-limit" {
+            max_line_len = None;
         } else if a == "--" {
             needle = args.next();
             break;
@@ -127,7 +140,11 @@ fn parse_args() -> Result<(String, usize), String> {
     if args.next().is_some() {
         return Err("too many positional arguments".to_string());
     }
-    Ok((needle, top_n))
+    Ok(Args {
+        needle,
+        top_n,
+        limits: Limits { max_file_size, max_line_len },
+    })
 }
 
 #[cfg(unix)]

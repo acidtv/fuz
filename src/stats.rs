@@ -7,6 +7,7 @@ pub struct Stats {
     pub files_binary_skip: AtomicU64,
     pub files_prefilter_skip: AtomicU64,
     pub files_oversize_skip: AtomicU64,
+    pub lines_oversize_skip: AtomicU64,
     pub bytes_read: AtomicU64,
     pub matches: AtomicU64,
     pub ns_io: AtomicU64,
@@ -25,6 +26,7 @@ impl Stats {
             files_binary_skip: AtomicU64::new(0),
             files_prefilter_skip: AtomicU64::new(0),
             files_oversize_skip: AtomicU64::new(0),
+            lines_oversize_skip: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             matches: AtomicU64::new(0),
             ns_io: AtomicU64::new(0),
@@ -57,6 +59,7 @@ impl Stats {
         eprintln!("  oversize skip : {}", n(&self.files_oversize_skip));
         eprintln!("  binary skip   : {}", n(&self.files_binary_skip));
         eprintln!("  prefilter skip: {}", n(&self.files_prefilter_skip));
+        eprintln!("long lines skip : {}", n(&self.lines_oversize_skip));
         eprintln!("matches written : {}", n(&self.matches));
         eprintln!("bytes read      : {mb:>9.2} MiB");
         eprintln!("throughput      : {:>9.2} MiB/s  (bytes_read / wall)", mb / (wall_ms / 1000.0));

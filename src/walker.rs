@@ -14,17 +14,26 @@ use crate::stats::Stats;
 use crate::topk::TopK;
 use crate::CANCEL;
 
-const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_MAX_LINE_LEN: usize = 64 * 1024;
 const BINARY_PROBE: usize = 8192;
 const PREFILTER_THRESHOLD: usize = 64 * 1024;
 const BOM: &[u8] = b"\xEF\xBB\xBF";
+
+#[derive(Clone, Copy)]
+pub struct Limits {
+    /// Skip files larger than this many bytes. `None` disables the cap.
+    pub max_file_size: Option<u64>,
+    /// Skip individual lines longer than this many bytes. `None` disables the cap.
+    pub max_line_len: Option<usize>,
+}
 
 thread_local! {
     static READ_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
     static PREFIX_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
 }
 
-pub fn run(matcher: Matcher, topk: Arc<TopK>, stats: &'static Stats) {
+pub fn run(matcher: Matcher, topk: Arc<TopK>, stats: &'static Stats, limits: Limits) {
     let matcher = Arc::new(matcher);
 
     let walker = WalkBuilder::new(".")
@@ -57,14 +66,14 @@ pub fn run(matcher: Matcher, topk: Arc<TopK>, stats: &'static Stats) {
             stats.files_seen.fetch_add(1, Ordering::Relaxed);
             let path = entry.path();
             let t_total = Instant::now();
-            search_file(path, &matcher, &topk, stats);
+            search_file(path, &matcher, &topk, stats, limits);
             Stats::add_ns(&stats.ns_total, t_total);
             WalkState::Continue
         })
     });
 }
 
-fn search_file(path: &Path, matcher: &Matcher, topk: &TopK, stats: &Stats) {
+fn search_file(path: &Path, matcher: &Matcher, topk: &TopK, stats: &Stats, limits: Limits) {
     READ_BUF.with(|read_cell| {
     PREFIX_BUF.with(|prefix_cell| {
             let mut buf = read_cell.borrow_mut();
@@ -82,10 +91,12 @@ fn search_file(path: &Path, matcher: &Matcher, topk: &TopK, stats: &Stats) {
             };
 
             let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-            if len > MAX_FILE_SIZE {
-                stats.files_oversize_skip.fetch_add(1, Ordering::Relaxed);
-                Stats::add_ns(&stats.ns_io, t_io);
-                return;
+            if let Some(cap) = limits.max_file_size {
+                if len > cap {
+                    stats.files_oversize_skip.fetch_add(1, Ordering::Relaxed);
+                    Stats::add_ns(&stats.ns_io, t_io);
+                    return;
+                }
             }
 
             #[cfg(target_os = "linux")]
@@ -127,9 +138,13 @@ fn search_file(path: &Path, matcher: &Matcher, topk: &TopK, stats: &Stats) {
 
             // === phase: search (scan + try_insert into TopK) ===
             let t_search = Instant::now();
-            let n_matches = search_buffer(path, &buf, matcher, topk, &mut prefix);
+            let (n_matches, n_skipped) =
+                search_buffer(path, &buf, matcher, topk, &mut prefix, limits.max_line_len);
             Stats::add_ns(&stats.ns_search, t_search);
             stats.matches.fetch_add(n_matches, Ordering::Relaxed);
+            if n_skipped > 0 {
+                stats.lines_oversize_skip.fetch_add(n_skipped, Ordering::Relaxed);
+            }
     });
     });
 }
@@ -140,7 +155,8 @@ fn search_buffer(
     matcher: &Matcher,
     topk: &TopK,
     prefix: &mut Vec<u8>,
-) -> u64 {
+    max_line_len: Option<usize>,
+) -> (u64, u64) {
     let path_bytes = path_to_bytes(path);
     let path_bytes = strip_dot_prefix(path_bytes);
 
@@ -152,6 +168,7 @@ fn search_buffer(
     let mut line_no: u64 = 1;
     let mut first_line = true;
     let mut n_matches: u64 = 0;
+    let mut n_skipped: u64 = 0;
 
     for newline_pos in memchr_iter(b'\n', buf) {
         let mut line_end = newline_pos;
@@ -161,6 +178,15 @@ fn search_buffer(
         let mut line = &buf[line_start..line_end];
         if first_line && line.starts_with(BOM) {
             line = &line[BOM.len()..];
+        }
+        if let Some(cap) = max_line_len {
+            if line.len() > cap {
+                n_skipped += 1;
+                line_start = newline_pos + 1;
+                line_no += 1;
+                first_line = false;
+                continue;
+            }
         }
         if let Some((score, start)) = matcher.match_score(line) {
             topk.try_insert(score, prefix, line_no, (start as u32).saturating_add(1), line);
@@ -179,12 +205,17 @@ fn search_buffer(
         if first_line && line.starts_with(BOM) {
             line = &line[BOM.len()..];
         }
+        if let Some(cap) = max_line_len {
+            if line.len() > cap {
+                return (n_matches, n_skipped + 1);
+            }
+        }
         if let Some((score, start)) = matcher.match_score(line) {
             topk.try_insert(score, prefix, line_no, (start as u32).saturating_add(1), line);
             n_matches += 1;
         }
     }
-    n_matches
+    (n_matches, n_skipped)
 }
 
 #[cfg(unix)]
