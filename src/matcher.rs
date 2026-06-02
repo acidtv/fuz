@@ -8,16 +8,18 @@ const BOUNDARY_BONUS: i32 = 5;
 /// Penalty per byte of "excess spread" beyond a contiguous substring match.
 /// A literal substring has zero excess spread.
 const SPREAD_PENALTY: i32 = 1;
-/// Floor score for any subsequence match whose entire span lies within a
-/// single alphanumeric run (one "word"). Sized so a within-word subseq with
-/// no boundary hit and substantial excess spread still scores strictly
-/// positive, so main.rs's `score > 0` filter keeps it (e.g. `medtl` against
-/// `immediately`: 5 needle chars spread over 8 bytes, no boundary hit →
-/// raw formula gives -3, but the within-word floor lifts it to +61).
-/// Cross-word matches do not get this floor — they fall back to the raw
-/// boundary/spread formula and can go non-positive, which is the desired
-/// behavior for cross-word junk like `requires` formed from `current ...
-/// acquires`.
+/// Floor score for any subsequence match whose gaps between consecutive
+/// matched positions are entirely alphanumeric — i.e. the haystack only
+/// crosses a non-alphanumeric byte where the needle itself contains one.
+/// Sized so a within-word subseq with no boundary hit and substantial
+/// excess spread still scores strictly positive, so main.rs's `score > 0`
+/// filter keeps it (e.g. `medtl` against `immediately`: 5 needle chars
+/// spread over 8 bytes, no boundary hit → raw formula gives -3, but the
+/// within-word floor lifts it to +61). Cross-word matches (gaps contain
+/// non-alphanumeric bytes the needle did not dictate) do not get this floor —
+/// they fall back to the raw boundary/spread formula and can go non-positive,
+/// which is the desired behavior for cross-word junk like `requires` formed
+/// from `current ... acquires`.
 const SINGLE_WORD_BASE: i32 = 64;
 /// Floor score for a case-insensitive literal substring match. Sized so that
 /// any literal match strictly beats any subsequence-only match: a within-word
@@ -97,14 +99,19 @@ impl Matcher {
     /// match. Scoring is three-tier:
     /// - **Literal substring match** (highest tier): score = LITERAL_BASE + boundary_bonus
     ///   at the match position. Any literal match strictly beats any non-literal match.
-    /// - **Within-word subsequence** (middle tier): the match span contains no
-    ///   non-alphanumeric bytes. Score = SINGLE_WORD_BASE + BOUNDARY_BONUS *
-    ///   boundary_hits - SPREAD_PENALTY * excess. The floor keeps these positive
-    ///   even without a boundary hit, so main.rs's `score > 0` filter keeps them.
-    /// - **Cross-word subsequence** (lowest tier): the match span crosses at
-    ///   least one non-alphanumeric byte. Score = BOUNDARY_BONUS * boundary_hits
-    ///   - SPREAD_PENALTY * excess. Can go non-positive and be dropped by main.rs
-    ///   — the desired behavior for junk like `requires` from `current ... acquires`.
+    /// - **Within-word subsequence** (middle tier): every byte in the gaps
+    ///   between consecutive matched positions is alphanumeric. Non-alphanumeric
+    ///   bytes at matched positions are fine — those were dictated by the needle
+    ///   (e.g. needle `CountryDiv(` against `CountryDivision(`: the `(` at the
+    ///   final matched position is forced by the needle, not an unwanted cross-
+    ///   word jump). Score = SINGLE_WORD_BASE + BOUNDARY_BONUS * boundary_hits
+    ///   - SPREAD_PENALTY * excess. The floor keeps these positive even without
+    ///   a boundary hit, so main.rs's `score > 0` filter keeps them.
+    /// - **Cross-word subsequence** (lowest tier): some gap between matched
+    ///   positions contains a non-alphanumeric byte. Score = BOUNDARY_BONUS *
+    ///   boundary_hits - SPREAD_PENALTY * excess. Can go non-positive and be
+    ///   dropped by main.rs — the desired behavior for junk like `requires`
+    ///   from `current ... acquires`.
     ///
     /// Implementation: **multi-start greedy.** Single-pass greedy from position 0
     /// picks the leftmost occurrence of needle[0], which often produces a bad
@@ -154,6 +161,7 @@ impl Matcher {
             let mut pos = start + 1;
             let mut last_pos = start;
             let mut boundary_hits: i32 = if start_boundary { 1 } else { 0 };
+            let mut within_one_word = true;
             let mut completed = true;
             for i in 1..n {
                 let inner = unsafe { hay.get_unchecked(pos..) };
@@ -165,6 +173,14 @@ impl Matcher {
                     }
                 };
                 let abs = pos + off2;
+                if within_one_word {
+                    for j in pos..abs {
+                        if !unsafe { *hay.get_unchecked(j) }.is_ascii_alphanumeric() {
+                            within_one_word = false;
+                            break;
+                        }
+                    }
+                }
                 last_pos = abs;
                 let prev = unsafe { *hay.get_unchecked(abs - 1) };
                 if !prev.is_ascii_alphanumeric() {
@@ -178,9 +194,6 @@ impl Matcher {
                 return best;
             }
 
-            let within_one_word = hay[start..=last_pos]
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric());
             let score = score_alignment(
                 n, start, last_pos, boundary_hits, start_boundary, within_one_word,
             );
@@ -218,6 +231,7 @@ impl Matcher {
             let mut pos = start + 1;
             let mut last_pos = start;
             let mut boundary_hits: i32 = if start_boundary { 1 } else { 0 };
+            let mut within_one_word = true;
             let mut completed = true;
             for i in 1..n {
                 let off2 = match memchr(self.lo[i], &folded[pos..]) {
@@ -228,6 +242,14 @@ impl Matcher {
                     }
                 };
                 let abs = pos + off2;
+                if within_one_word {
+                    for j in pos..abs {
+                        if !hay[j].is_ascii_alphanumeric() {
+                            within_one_word = false;
+                            break;
+                        }
+                    }
+                }
                 last_pos = abs;
                 if !hay[abs - 1].is_ascii_alphanumeric() {
                     boundary_hits += 1;
@@ -238,9 +260,6 @@ impl Matcher {
                 return best;
             }
 
-            let within_one_word = hay[start..=last_pos]
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric());
             let score = score_alignment(
                 n, start, last_pos, boundary_hits, start_boundary, within_one_word,
             );
@@ -385,6 +404,18 @@ mod tests {
             with_boundary > without_boundary,
             "with_boundary={with_boundary} without_boundary={without_boundary}"
         );
+    }
+
+    #[test]
+    fn needle_with_punctuation_inside_one_word_scores_positive() {
+        // `CountryDiv(` matched against `class CountryDivision():` aligns
+        // `CountryDiv` contiguously inside the identifier, then jumps to the
+        // `(` after `…ision`. The `(` is a non-alphanumeric byte in the span,
+        // but it's the matched position for needle's own `(` — not an unwanted
+        // cross-word jump. Must score > 0 so main.rs keeps it.
+        let m = Matcher::new("CountryDiv(");
+        let s = m.match_score(b"class CountryDivision():").unwrap().0;
+        assert!(s > 0, "score was {s}");
     }
 
     #[test]
