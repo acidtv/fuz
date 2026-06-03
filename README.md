@@ -1,11 +1,22 @@
 # fuz
 
-Fast fuzzy text-file searching.
+Fast fuzzy text-file searching with custom ranking tailored for searching sourcecode.
 
 > [!WARNING]
 > This is competely vibe-coded. I did not read the sourcecode. Use at your own risk!
 
-Like ripgrep, but with fuzzy matching instead of regular expression matching.
+I made this to use with Telescope in Neovim. To use fuz with Telescope add this to your config:
+```lua
+    telescope = require("telescope")
+    telescope.setup({
+        defaults = {
+            vimgrep_arguments = {
+                "fuz",
+                "-n100",
+            }
+		}
+	})
+```
 
 ## Installing
 
