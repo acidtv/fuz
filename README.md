@@ -21,6 +21,20 @@ fuz [-n N] [--no-file-limit] [--no-line-limit] PATTERN
 - `--no-file-limit` — search files larger than 10 MiB (skipped by default).
 - `--no-line-limit` — search lines longer than 64 KiB (skipped by default).
 
+## Ranking
+
+Matches are ranked in three tiers, best first:
+
+1. **Literal** — the needle appears verbatim in the line.
+2. **Within-word subsequence** — needle chars appear in order inside a single word (e.g. `rqrs` in `requires`).
+3. **Cross-word subsequence** — needle chars span multiple words (e.g. `clscntrdiv` matching `class CountryDivision`).
+
+Within a tier, alignments that hit more **word boundaries** rank higher. A boundary is the start of the line, a position right after a separator (`_`, `-`, `.`, space, …), or a CamelCase transition (lowercase followed by uppercase, like `r`→`D` in `CountryDivision`). Tighter alignments — fewer wasted bytes between matched needle chars — also rank higher.
+
+Case-sensitivity is *smart*: an uppercase char anywhere in the needle makes the search case-sensitive; otherwise it's case-insensitive.
+
+## Example
+
 Example searching the Linux kernel source:
 ```bash
 linux-7.1-rc6$ time fuz bpflstdta

@@ -2,8 +2,10 @@ use std::borrow::Cow;
 
 use memchr::{memchr, memchr2};
 
-/// Per-needle-char bonus when that char lands at a word boundary
-/// (preceded by a non-alphanumeric byte, or at position 0).
+/// Per-needle-char bonus when that char lands at a word boundary. A boundary
+/// is position 0, a position preceded by a non-alphanumeric byte (space, `_`,
+/// `-`, `.`, …), or a CamelCase transition — a lowercase byte immediately
+/// followed by an uppercase byte (e.g. `r`→`D` in `CountryDivision`).
 const BOUNDARY_BONUS: i32 = 5;
 /// Penalty per byte of "excess spread" beyond a contiguous substring match.
 /// A literal substring has zero excess spread.
@@ -11,15 +13,14 @@ const SPREAD_PENALTY: i32 = 1;
 /// Floor score for any subsequence match whose gaps between consecutive
 /// matched positions are entirely alphanumeric — i.e. the haystack only
 /// crosses a non-alphanumeric byte where the needle itself contains one.
-/// Sized so a within-word subseq with no boundary hit and substantial
-/// excess spread still scores strictly positive, so main.rs's `score > 0`
-/// filter keeps it (e.g. `medtl` against `immediately`: 5 needle chars
-/// spread over 8 bytes, no boundary hit → raw formula gives -3, but the
-/// within-word floor lifts it to +61). Cross-word matches (gaps contain
-/// non-alphanumeric bytes the needle did not dictate) do not get this floor —
-/// they fall back to the raw boundary/spread formula and can go non-positive,
-/// which is the desired behavior for cross-word junk like `requires` formed
-/// from `current ... acquires`.
+/// Sized so a within-word subseq lifts clearly above cross-word matches in
+/// the ranking, even without a boundary hit (e.g. `medtl` against
+/// `immediately`: 5 needle chars spread over 8 bytes, no boundary hit → raw
+/// formula gives -3, but the within-word floor lifts it to +61). Cross-word
+/// matches (gaps contain non-alphanumeric bytes the needle did not dictate)
+/// do not get this floor — they fall back to the raw boundary/spread formula
+/// and can go negative, which ranks cross-word junk like `requires` formed
+/// from `current ... acquires` below real matches.
 const SINGLE_WORD_BASE: i32 = 64;
 /// Floor score for a case-insensitive literal substring match. Sized so that
 /// any literal match strictly beats any subsequence-only match: a within-word
@@ -27,6 +28,23 @@ const SINGLE_WORD_BASE: i32 = 64;
 /// BOUNDARY_BONUS * needle_len, which for a 64-char needle is 384; we set
 /// the floor well above that.
 const LITERAL_BASE: i32 = 1024;
+
+/// `pos` is at a word boundary in `hay`: position 0, preceded by a
+/// non-alphanumeric byte, or a CamelCase transition (lowercase → uppercase).
+/// Caller must ensure `pos < hay.len()`.
+#[inline(always)]
+fn boundary_at(hay: &[u8], pos: usize) -> bool {
+    debug_assert!(pos < hay.len());
+    if pos == 0 {
+        return true;
+    }
+    let prev = unsafe { *hay.get_unchecked(pos - 1) };
+    if !prev.is_ascii_alphanumeric() {
+        return true;
+    }
+    let cur = unsafe { *hay.get_unchecked(pos) };
+    prev.is_ascii_lowercase() && cur.is_ascii_uppercase()
+}
 
 #[inline(always)]
 fn score_alignment(
@@ -105,13 +123,12 @@ impl Matcher {
     ///   (e.g. needle `CountryDiv(` against `CountryDivision(`: the `(` at the
     ///   final matched position is forced by the needle, not an unwanted cross-
     ///   word jump). Score = SINGLE_WORD_BASE + BOUNDARY_BONUS * boundary_hits
-    ///   - SPREAD_PENALTY * excess. The floor keeps these positive even without
-    ///   a boundary hit, so main.rs's `score > 0` filter keeps them.
+    ///   - SPREAD_PENALTY * excess. The floor keeps these clearly above
+    ///   cross-word matches in the ranking.
     /// - **Cross-word subsequence** (lowest tier): some gap between matched
     ///   positions contains a non-alphanumeric byte. Score = BOUNDARY_BONUS *
-    ///   boundary_hits - SPREAD_PENALTY * excess. Can go non-positive and be
-    ///   dropped by main.rs — the desired behavior for junk like `requires`
-    ///   from `current ... acquires`.
+    ///   boundary_hits - SPREAD_PENALTY * excess. Can go negative, ranking
+    ///   junk like `requires` from `current ... acquires` below real matches.
     ///
     /// Implementation: **multi-start greedy.** Single-pass greedy from position 0
     /// picks the leftmost occurrence of needle[0], which often produces a bad
@@ -155,7 +172,7 @@ impl Matcher {
                 None => return best,
             };
             let start = search_from + off;
-            let start_boundary = start == 0 || !hay[start - 1].is_ascii_alphanumeric();
+            let start_boundary = boundary_at(hay, start);
 
             // Greedy forward from `start`.
             let mut pos = start + 1;
@@ -182,8 +199,7 @@ impl Matcher {
                     }
                 }
                 last_pos = abs;
-                let prev = unsafe { *hay.get_unchecked(abs - 1) };
-                if !prev.is_ascii_alphanumeric() {
+                if boundary_at(hay, abs) {
                     boundary_hits += 1;
                 }
                 pos = abs + 1;
@@ -226,7 +242,7 @@ impl Matcher {
                 None => return best,
             };
             let start = search_from + off;
-            let start_boundary = start == 0 || !hay[start - 1].is_ascii_alphanumeric();
+            let start_boundary = boundary_at(hay, start);
 
             let mut pos = start + 1;
             let mut last_pos = start;
@@ -251,7 +267,7 @@ impl Matcher {
                     }
                 }
                 last_pos = abs;
-                if !hay[abs - 1].is_ascii_alphanumeric() {
+                if boundary_at(hay, abs) {
                     boundary_hits += 1;
                 }
                 pos = abs + 1;
@@ -362,14 +378,18 @@ mod tests {
 
     #[test]
     fn case_insensitive_same_score() {
+        // Matching is case-insensitive, so uniformly lower- and uniformly
+        // upper-case haystacks score identically. (A CamelCase haystack
+        // would score higher — CamelCase transitions are real boundaries;
+        // see camelcase_transition_counts_as_boundary.)
         let m = Matcher::new("pttrn");
-        assert_eq!(m.match_score(b"pattern"), m.match_score(b"PaTTern"));
+        assert_eq!(m.match_score(b"pattern"), m.match_score(b"PATTERN"));
     }
 
     #[test]
     fn subseq_within_one_word_scores_positive() {
-        // `rqrs` clustering inside `requires` is a real match the user wants
-        // to see. Score must be > 0 so the main.rs filter keeps it.
+        // `rqrs` clustering inside `requires` is a real match. Score must be
+        // clearly positive so it ranks above cross-word junk.
         let m = Matcher::new("rqrs");
         let s = m.match_score(b"            ... requires ...").unwrap().0;
         assert!(s > 0, "score was {s}");
@@ -381,7 +401,7 @@ mod tests {
         // (no leading word boundary), so boundary_hits=0. The raw boundary/
         // spread formula gives a negative score, but the entire match span is
         // inside one alphanumeric run — the within-word floor must keep it
-        // positive so main.rs's `score > 0` filter doesn't drop it.
+        // positive so it ranks above cross-word matches.
         let m = Matcher::new("medtl");
         let s = m.match_score(b"  immediately follows").unwrap().0;
         assert!(s > 0, "score was {s}");
@@ -407,12 +427,35 @@ mod tests {
     }
 
     #[test]
+    fn camelcase_transition_counts_as_boundary() {
+        // A lowercase byte immediately followed by an uppercase byte starts
+        // a new "word". Without this, `gun` aligning over `getUserName`
+        // would hit only one boundary (the leading 'g'); with it, the U
+        // after 't' and the N after 'r' each add a BOUNDARY_BONUS.
+        let m = Matcher::new("gun");
+        let camel = m.match_score(b"getUserName").unwrap().0;
+        let flat = m.match_score(b"getusername").unwrap().0;
+        assert!(camel > flat, "camel={camel} flat={flat}");
+    }
+
+    #[test]
+    fn camelcase_lifts_cross_word_match() {
+        // `clscntrdiv` matching `class CountryDivision`: c@start, C after
+        // space, and D after y (CamelCase) — three boundary hits. Without
+        // CamelCase support, the D would not count and the score would be
+        // 5 lower. Either way the score must be clearly positive.
+        let m = Matcher::new("clscntrdiv");
+        let s = m.match_score(b"class CountryDivision:").unwrap().0;
+        assert!(s > 5, "score was {s}");
+    }
+
+    #[test]
     fn needle_with_punctuation_inside_one_word_scores_positive() {
         // `CountryDiv(` matched against `class CountryDivision():` aligns
         // `CountryDiv` contiguously inside the identifier, then jumps to the
         // `(` after `…ision`. The `(` is a non-alphanumeric byte in the span,
         // but it's the matched position for needle's own `(` — not an unwanted
-        // cross-word jump. Must score > 0 so main.rs keeps it.
+        // cross-word jump. Must score > 0 to rank above cross-word matches.
         let m = Matcher::new("CountryDiv(");
         let s = m.match_score(b"class CountryDivision():").unwrap().0;
         assert!(s > 0, "score was {s}");
@@ -421,7 +464,8 @@ mod tests {
     #[test]
     fn subseq_spread_across_words_scores_nonpositive() {
         // `requires` matching via chars from `current` + `acquires` is junk
-        // and must not survive the main.rs `score > 0` filter.
+        // and must rank below within-word matches — scoring it non-positive
+        // ensures it sits below the within-word floor.
         let m = Matcher::new("requires");
         let s = m.match_score(b"beat the current cutoff. Slow-path acquires").unwrap().0;
         assert!(s <= 0, "score was {s}");

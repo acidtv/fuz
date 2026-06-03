@@ -66,16 +66,8 @@ fn main() {
     // a 64 KiB BufWriter. The explicit sort overrides the heap's internal tiebreaks
     // (which use path-desc to drive eviction) so users see alphabetical order within
     // tied scores.
-    //
-    // Quality filter: drop matches with score <= 0. The matcher is tuned so that
-    // any subsequence cluster contained within a single word scores positive,
-    // while spread-across-words subsequence "matches" (the common source of junk
-    // results — e.g. `requires` matching via `current ... acquires`) go negative.
-    // This filters the junk without hiding real subseq matches (e.g. `rqrs` finding
-    // the cluster inside the word `requires`).
     let topk = Arc::try_unwrap(topk).ok().expect("topk has one ref after walker.run returns");
     let mut results = topk.into_sorted_best_first();
-    results.retain(|r| r.score > 0);
     results.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
