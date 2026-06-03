@@ -15,12 +15,11 @@ const SPREAD_PENALTY: i32 = 1;
 /// crosses a non-alphanumeric byte where the needle itself contains one.
 /// Sized so a within-word subseq lifts clearly above cross-word matches in
 /// the ranking, even without a boundary hit (e.g. `medtl` against
-/// `immediately`: 5 needle chars spread over 8 bytes, no boundary hit → raw
-/// formula gives -3, but the within-word floor lifts it to +61). Cross-word
-/// matches (gaps contain non-alphanumeric bytes the needle did not dictate)
-/// do not get this floor — they fall back to the raw boundary/spread formula
-/// and can go negative, which ranks cross-word junk like `requires` formed
-/// from `current ... acquires` below real matches.
+/// `immediately`: bonus_sum=0, excess=3 → raw formula gives -3, but the
+/// within-word floor lifts it to +61). Cross-word matches do not get this
+/// floor — they fall back to the raw bonus/spread formula and can go
+/// negative, which ranks cross-word junk like `requires` formed from
+/// `current ... acquires` below real matches.
 const SINGLE_WORD_BASE: i32 = 64;
 /// Floor score for a case-insensitive literal substring match. Sized so that
 /// any literal match strictly beats any subsequence-only match: a within-word
@@ -51,7 +50,7 @@ fn score_alignment(
     needle_len: usize,
     first_pos: usize,
     last_pos: usize,
-    boundary_hits: i32,
+    bonus_sum: i32,
     start_boundary: bool,
     within_one_word: bool,
 ) -> i32 {
@@ -61,9 +60,9 @@ fn score_alignment(
     if excess == 0 {
         LITERAL_BASE + if start_boundary { BOUNDARY_BONUS } else { 0 }
     } else if within_one_word {
-        SINGLE_WORD_BASE + BOUNDARY_BONUS * boundary_hits - SPREAD_PENALTY * excess
+        SINGLE_WORD_BASE + bonus_sum - SPREAD_PENALTY * excess
     } else {
-        BOUNDARY_BONUS * boundary_hits - SPREAD_PENALTY * excess
+        bonus_sum - SPREAD_PENALTY * excess
     }
 }
 
@@ -118,17 +117,22 @@ impl Matcher {
     /// - **Literal substring match** (highest tier): score = LITERAL_BASE + boundary_bonus
     ///   at the match position. Any literal match strictly beats any non-literal match.
     /// - **Within-word subsequence** (middle tier): every byte in the gaps
-    ///   between consecutive matched positions is alphanumeric. Non-alphanumeric
-    ///   bytes at matched positions are fine — those were dictated by the needle
-    ///   (e.g. needle `CountryDiv(` against `CountryDivision(`: the `(` at the
-    ///   final matched position is forced by the needle, not an unwanted cross-
-    ///   word jump). Score = SINGLE_WORD_BASE + BOUNDARY_BONUS * boundary_hits
-    ///   - SPREAD_PENALTY * excess. The floor keeps these clearly above
-    ///   cross-word matches in the ranking.
-    /// - **Cross-word subsequence** (lowest tier): some gap between matched
-    ///   positions contains a non-alphanumeric byte. Score = BOUNDARY_BONUS *
-    ///   boundary_hits - SPREAD_PENALTY * excess. Can go negative, ranking
-    ///   junk like `requires` from `current ... acquires` below real matches.
+    ///   between consecutive matched positions is alphanumeric. Score =
+    ///   SINGLE_WORD_BASE + bonus_sum - SPREAD_PENALTY * excess.
+    /// - **Cross-word subsequence** (lowest tier): some gap contains a
+    ///   non-alphanumeric byte. Score = bonus_sum - SPREAD_PENALTY * excess.
+    ///   Can go negative, ranking junk like `requires` from `current ...
+    ///   acquires` below real matches.
+    ///
+    /// `bonus_sum` uses fzf-style **consecutive-run inheritance**: each
+    /// matched char gets BOUNDARY_BONUS if its position is a boundary, OR if
+    /// it matched adjacent to the previous matched char which itself had a
+    /// bonus. A boundary spreads forward through the contiguous run that
+    /// follows it. This is what makes `clscoundiv(` rank
+    /// `class CountryDivision(...)` (contiguous `div` cluster, inherited
+    /// bonus covers 3 chars) above `class CountryDetailView(...)` (the
+    /// needle's `v` lands on the `V` of `View` — a boundary, but isolated,
+    /// so the bonus doesn't spread).
     ///
     /// Implementation: **multi-start greedy.** Single-pass greedy from position 0
     /// picks the leftmost occurrence of needle[0], which often produces a bad
@@ -174,10 +178,19 @@ impl Matcher {
             let start = search_from + off;
             let start_boundary = boundary_at(hay, start);
 
-            // Greedy forward from `start`.
+            // Greedy forward from `start`. Bonus accounting: each matched
+            // char's effective bonus is the max of its own boundary bonus
+            // and (if it's adjacent to the previous matched char) the
+            // previous char's effective bonus. This spreads a boundary
+            // bonus across a contiguous needle run (fzf-style), so a tight
+            // `div` inside `Division` outscores a scattered `d…i…V` smeared
+            // across `Detail`+`View`.
+            let start_bonus = if start_boundary { BOUNDARY_BONUS } else { 0 };
             let mut pos = start + 1;
             let mut last_pos = start;
-            let mut boundary_hits: i32 = if start_boundary { 1 } else { 0 };
+            let mut bonus_sum: i32 = start_bonus;
+            let mut prev_eff_bonus: i32 = start_bonus;
+            let mut prev_abs: usize = start;
             let mut within_one_word = true;
             let mut completed = true;
             for i in 1..n {
@@ -198,10 +211,13 @@ impl Matcher {
                         }
                     }
                 }
+                let own = if boundary_at(hay, abs) { BOUNDARY_BONUS } else { 0 };
+                let inherited = if abs == prev_abs + 1 { prev_eff_bonus } else { 0 };
+                let eff = own.max(inherited);
+                bonus_sum += eff;
                 last_pos = abs;
-                if boundary_at(hay, abs) {
-                    boundary_hits += 1;
-                }
+                prev_abs = abs;
+                prev_eff_bonus = eff;
                 pos = abs + 1;
             }
             if !completed {
@@ -211,7 +227,7 @@ impl Matcher {
             }
 
             let score = score_alignment(
-                n, start, last_pos, boundary_hits, start_boundary, within_one_word,
+                n, start, last_pos, bonus_sum, start_boundary, within_one_word,
             );
             if score == best_possible {
                 return Some((score, start));
@@ -244,9 +260,12 @@ impl Matcher {
             let start = search_from + off;
             let start_boundary = boundary_at(hay, start);
 
+            let start_bonus = if start_boundary { BOUNDARY_BONUS } else { 0 };
             let mut pos = start + 1;
             let mut last_pos = start;
-            let mut boundary_hits: i32 = if start_boundary { 1 } else { 0 };
+            let mut bonus_sum: i32 = start_bonus;
+            let mut prev_eff_bonus: i32 = start_bonus;
+            let mut prev_abs: usize = start;
             let mut within_one_word = true;
             let mut completed = true;
             for i in 1..n {
@@ -266,10 +285,13 @@ impl Matcher {
                         }
                     }
                 }
+                let own = if boundary_at(hay, abs) { BOUNDARY_BONUS } else { 0 };
+                let inherited = if abs == prev_abs + 1 { prev_eff_bonus } else { 0 };
+                let eff = own.max(inherited);
+                bonus_sum += eff;
                 last_pos = abs;
-                if boundary_at(hay, abs) {
-                    boundary_hits += 1;
-                }
+                prev_abs = abs;
+                prev_eff_bonus = eff;
                 pos = abs + 1;
             }
             if !completed {
@@ -277,7 +299,7 @@ impl Matcher {
             }
 
             let score = score_alignment(
-                n, start, last_pos, boundary_hits, start_boundary, within_one_word,
+                n, start, last_pos, bonus_sum, start_boundary, within_one_word,
             );
             if score == best_possible {
                 return Some((score, start));
@@ -436,6 +458,28 @@ mod tests {
         let camel = m.match_score(b"getUserName").unwrap().0;
         let flat = m.match_score(b"getusername").unwrap().0;
         assert!(camel > flat, "camel={camel} flat={flat}");
+    }
+
+    #[test]
+    fn contiguous_cluster_beats_scattered_boundary_matches() {
+        // The user's real-world case: needle `clscoundiv(` should prefer
+        // `CountryDivision(...)` (contiguous `div` inside Division) over
+        // `CountryDetailView(...)` (the needle's `v` lands on the `V` of
+        // `View` — a CamelCase boundary but isolated). Without consecutive-
+        // run inheritance, DetailView wins by a stray +5 from that V.
+        let m = Matcher::new("clscoundiv(");
+        let division = m
+            .match_score(b"class CountryDivision(models.Model):")
+            .unwrap()
+            .0;
+        let detailview = m
+            .match_score(b"class CountryDetailView(BaseCountryDetailView):")
+            .unwrap()
+            .0;
+        assert!(
+            division > detailview,
+            "division={division} detailview={detailview}"
+        );
     }
 
     #[test]

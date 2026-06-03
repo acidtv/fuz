@@ -29,7 +29,7 @@ Matches are ranked in three tiers, best first:
 2. **Within-word subsequence** — needle chars appear in order inside a single word (e.g. `rqrs` in `requires`).
 3. **Cross-word subsequence** — needle chars span multiple words (e.g. `clscntrdiv` matching `class CountryDivision`).
 
-Within a tier, alignments that hit more **word boundaries** rank higher. A boundary is the start of the line, a position right after a separator (`_`, `-`, `.`, space, …), or a CamelCase transition (lowercase followed by uppercase, like `r`→`D` in `CountryDivision`). Tighter alignments — fewer wasted bytes between matched needle chars — also rank higher.
+Within a tier, alignments that hit more **word boundaries** rank higher. A boundary is the start of the line, a position right after a separator (`_`, `-`, `.`, space, …), or a CamelCase transition (lowercase followed by uppercase, like `r`→`D` in `CountryDivision`). The bonus extends forward through any contiguous run of matched chars that follows — so `div` matching `D-i-v` together inside `Division` is rewarded across all three chars, while `div` scattered across `D`etail+`V`iew is rewarded only at the isolated boundaries. Tighter alignments — fewer wasted bytes between matched needle chars — also rank higher.
 
 Case-sensitivity is *smart*: an uppercase char anywhere in the needle makes the search case-sensitive; otherwise it's case-insensitive.
 
